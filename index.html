@@ -67,10 +67,33 @@
 .lines-table input[type=“text”]:focus { border-color: var(–magenta); }
 .amt-input { font-family: var(–mono) !important; color: var(–green) !important; width: 88px !important; }
 .phone-num { font-family: var(–mono); font-size: 12px; color: var(–muted); }
-.toggle { appearance: none; width: 36px; height: 20px; background: var(–border); border-radius: 10px; cursor: pointer; position: relative; transition: background 0.2s; flex-shrink: 0; display: block; }
-.toggle::after { content: ‘’; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; background: white; border-radius: 50%; transition: left 0.2s; }
+.toggle {
+-webkit-appearance: none;
+appearance: none;
+width: 40px; height: 22px;
+background: #444;
+border-radius: 11px;
+cursor: pointer;
+position: relative;
+transition: background 0.2s;
+flex-shrink: 0;
+display: inline-block;
+vertical-align: middle;
+border: none;
+outline: none;
+}
+.toggle::after {
+content: ‘’;
+position: absolute;
+top: 3px; left: 3px;
+width: 16px; height: 16px;
+background: white;
+border-radius: 50%;
+transition: left 0.2s;
+box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+}
 .toggle:checked { background: var(–magenta); }
-.toggle:checked::after { left: 19px; }
+.toggle:checked::after { left: 21px; }
 .note-tag { font-family: var(–mono); font-size: 10px; color: #555; background: #252525; border-radius: 4px; padding: 2px 6px; margin-left: 4px; white-space: nowrap; }
 
 .totals-block { border-top: 1px solid var(–border); padding-top: 14px; margin-top: 4px; display: flex; flex-direction: column; gap: 6px; }
@@ -143,6 +166,10 @@
     <span class="val" id="splitTotal">$0.00</span>
   </div>
   <div class="total-row">
+    <span class="lbl">ABSORBED (hidden lines)</span>
+    <span class="val" id="absorbedTotal" style="font-size:14px;color:var(--muted)">$0.00</span>
+  </div>
+  <div class="total-row" style="border-top:1px solid var(--border);padding-top:10px;margin-top:6px">
     <span class="lbl">BILL TOTAL DUE</span>
     <span class="val m" id="billTotalDisp">$0.00</span>
   </div>
@@ -172,7 +199,7 @@ const NAME_MAP = {
   '9320':'Regina', '1905':'Subramani', '7522':'Leo', '9607':'Darwin',
   '5404':'Manoj',  '2799':'Dinesh',    '6701':'Subramani 2', '3097':'Jay',
   '7402':'Satheesh','9415':'Mekala',   '3867':'Manoj 2',     '4721':'Jay 2',
-  '5502':'New Line'
+  '5502':'Jay 2'
 };
 
 // ─── Equipment reassignment rules ─────────────────────────────────────────────
@@ -289,17 +316,24 @@ function parseBill(text) {
     const equipStr   = fields[1] || '-';
     const numericFields = fields.filter(f => f !== 'Included' && f !== '-');
 
-    // One-time = second-to-last numeric if 5+ columns present, else 0
-    // We detect 5-column bills by checking if "One-time charges" appears in the table header
+    // One-time = second-to-last numeric if 5-column bill AND the line actually has a
+    // distinct one-time charge (rawTotal must exceed equip+plans, otherwise it's just
+    // the equipment value appearing twice in numericFields for removed/device-only lines)
     const hasOneTimeCol = /One-time charges/i.test(block);
-    const oneTimeStr = hasOneTimeCol && numericFields.length >= 2
-      ? numericFields[numericFields.length - 2]
-      : '-';
+    const rawTotalVal = numericFields.length ? parseMoney(numericFields[numericFields.length-1]) : 0;
+    const secondLast  = hasOneTimeCol && numericFields.length >= 2
+      ? parseMoney(numericFields[numericFields.length - 2])
+      : 0;
+    // Only treat it as a real one-time charge if it's different from the equip value
+    // (avoids the case where equip=7.25, total=7.25, so numericFields=['$7.25','$7.25'])
+    const equipVal  = parseMoney(equipStr);
+    const plansVal  = plansStr === 'Included' ? 0 : plansStr === '-' ? 0 : parseMoney(plansStr);
+    const oneTime   = (hasOneTimeCol && secondLast > 0 && secondLast !== equipVal && secondLast !== plansVal)
+      ? secondLast : 0;
 
     const plans   = plansStr === 'Included' ? 'included' : plansStr === '-' ? 0 : parseMoney(plansStr);
-    const equip   = parseMoney(equipStr);
-    const oneTime = parseMoney(oneTimeStr);
-    const rawTotal = numericFields.length ? parseMoney(numericFields[numericFields.length-1]) : 0;
+    const equip   = equipVal;
+    const rawTotal = rawTotalVal;
 
     rawLines.push({ number:`(${area}) ${pre}-${line4}`, last4:line4, lineType, plans, equip, oneTime, rawTotal });
   }
@@ -407,24 +441,45 @@ function renderTable() {
 
 function updateTotals() {
   const shown = parsedLines.filter(l => l.include);
-  const sum = Math.round(shown.reduce((s,l) => s + (parseFloat(l.amount)||0), 0) * 100) / 100;
-  document.getElementById('splitTotal').textContent = `$${sum.toFixed(2)}`;
+  const hidden = parsedLines.filter(l => !l.include);
+  const shownSum  = Math.round(shown.reduce((s,l) => s + (parseFloat(l.amount)||0), 0) * 100) / 100;
+  const hiddenSum = Math.round(hidden.reduce((s,l) => s + (parseFloat(l.amount)||0), 0) * 100) / 100;
+  const grandSum  = Math.round((shownSum + hiddenSum) * 100) / 100;
+
+  document.getElementById('splitTotal').textContent = `$${shownSum.toFixed(2)}`;
+  document.getElementById('absorbedTotal').textContent = hiddenSum > 0 ? `$${hiddenSum.toFixed(2)}` : '—';
 
   const banner = document.getElementById('vbanner');
   if (!billTotal) { banner.innerHTML = ''; return; }
 
-  const diff = Math.abs(sum - billTotal);
+  const diff = Math.abs(grandSum - billTotal);
   if (diff < 0.02) {
-    banner.innerHTML = `<div class="vbanner ok">✓ Split total $${sum.toFixed(2)} matches bill — you're all set!</div>`;
+    // Grand total (shown + absorbed) matches bill — all good
+    const absorbedNote = hiddenSum > 0
+      ? ` · $${hiddenSum.toFixed(2)} absorbed by ${getAbsorberNames()}`
+      : '';
+    banner.innerHTML = `<div class="vbanner ok">✓ All splits account for $${billTotal.toFixed(2)} bill — shown $${shownSum.toFixed(2)}${absorbedNote}</div>`;
   } else {
-    const hidden = parsedLines.filter(l => !l.include);
-    const hiddenSum = Math.round(hidden.reduce((s,l) => s + (parseFloat(l.amount)||0), 0) * 100) / 100;
-    const gap = sum < billTotal
-      ? `$${(billTotal-sum).toFixed(2)} unaccounted`
-      : `$${(sum-billTotal).toFixed(2)} over-allocated`;
-    const hiddenNote = hiddenSum > 0 ? ` · $${hiddenSum.toFixed(2)} absorbed in hidden lines` : '';
-    banner.innerHTML = `<div class="vbanner warn">⚠ Shown split $${sum.toFixed(2)} vs Bill $${billTotal.toFixed(2)} — ${gap}${hiddenNote}</div>`;
+    const gap = grandSum < billTotal
+      ? `$${(billTotal - grandSum).toFixed(2)} still unaccounted`
+      : `$${(grandSum - billTotal).toFixed(2)} over-allocated`;
+    banner.innerHTML = `<div class="vbanner warn">⚠ Split total $${grandSum.toFixed(2)} vs Bill $${billTotal.toFixed(2)} — ${gap}. Check amounts above.</div>`;
   }
+}
+
+function getAbsorberNames() {
+  // Build a readable summary of who absorbs what
+  const absorbMap = {}; // absorberName → total absorbed
+  parsedLines.filter(l => !l.include && l.amount > 0).forEach(l => {
+    const absorberLast4 = Object.values ? (() => {
+      // find absorber from ABSORB_INTO
+      const entry = Object.entries(ABSORB_INTO).find(([k]) => k === l.last4);
+      return entry ? entry[1] : null;
+    })() : null;
+    const absorberName = absorberLast4 ? (NAME_MAP[absorberLast4] || absorberLast4) : 'others';
+    absorbMap[absorberName] = (absorbMap[absorberName] || 0) + l.amount;
+  });
+  return Object.entries(absorbMap).map(([n, v]) => `${n} ($${v.toFixed(2)})`).join(', ') || 'hidden lines';
 }
 
 // ─── Image Generation ─────────────────────────────────────────────────────────

@@ -26,9 +26,9 @@
 .header span { color: var(–magenta); }
 .header-sub { font-size: 13px; color: var(–muted); font-family: var(–mono); margin-top: 2px; }
 
-.upload-zone { border: 1.5px dashed var(–border); border-radius: 16px; padding: 48px 32px; text-align: center; cursor: pointer; transition: all 0.2s; background: var(–surface); position: relative; overflow: hidden; }
+.upload-zone { border: 1.5px dashed var(–border); border-radius: 16px; padding: 48px 32px; text-align: center; cursor: pointer; transition: all 0.2s; background: var(–surface); }
 .upload-zone:hover, .upload-zone.drag-over { border-color: var(–magenta); background: #1e0010; }
-.upload-zone input[type=“file”] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+#pdfInput { display: none; }
 .upload-icon { width: 56px; height: 56px; background: #1e0010; border: 1.5px solid var(–magenta-dim); border-radius: 12px; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; font-size: 24px; }
 .upload-zone h3 { font-family: var(–display); font-size: 18px; font-weight: 700; margin-bottom: 6px; }
 .upload-zone p { color: var(–muted); font-size: 13px; font-family: var(–mono); }
@@ -107,8 +107,8 @@
     </div>
   </div>
 
-  <div class="upload-zone" id="uploadZone">
-    <input type="file" id="pdfInput" accept=".pdf" />
+  <input type="file" id="pdfInput" accept=".pdf" />
+  <div class="upload-zone" id="uploadZone" onclick="document.getElementById('pdfInput').click()">
     <div class="upload-icon">📄</div>
     <h3>Drop your T-Mobile PDF bill</h3>
     <p>Drag & drop or click to select</p>
@@ -187,6 +187,7 @@ const EQUIP_REASSIGN = {
 const ABSORB_INTO = {
   '4721': '3097',   // Jay 2's line → Jay absorbs
   '9861': '3097',   // Removed tracker → Jay absorbs
+  '3867': '3097',   // Removed SyncUP Watch → Jay absorbs
 };
 
 let parsedLines = [];
@@ -276,25 +277,31 @@ function parseBill(text) {
     else if (rest.startsWith('Voice')) { rest = rest.slice('Voice'.length).trim(); }
 
     // Extract all money/Included/dash fields
+    // Summary table columns: Plans | Equipment | Services | [One-time charges] | Total
     // Field pattern: "Included" | "$X.XX" | "-$X.XX" | standalone "-"
     const fieldRe = /(Included|[-]?\$[\d,]+\.\d{2}|(?<![0-9$])-(?![0-9$]))/g;
     const fields = [...rest.matchAll(fieldRe)].map(m => m[1]);
 
-    // plans = fields[0], equip = fields[1], services = fields[2], total = fields[3]
-    // (for lines with only 3 fields, adjust)
-    const plansStr = fields[0] || '-';
-    const equipStr = fields[1] || '-';
-
-    const plans = plansStr === 'Included' ? 'included'
-                : plansStr === '-'        ? 0
-                : parseMoney(plansStr);
-    const equip = parseMoney(equipStr);
-
-    // Raw total = last numeric field
+    // fields[0]=Plans, fields[1]=Equip, fields[2]=Services, fields[3]=One-time, fields[4]=Total
+    // When no one-time column: fields[0]=Plans, fields[1]=Equip, fields[2]=Services, fields[3]=Total
+    // The LAST field is always Total. One-time is the second-to-last if there are 5 fields.
+    const plansStr   = fields[0] || '-';
+    const equipStr   = fields[1] || '-';
     const numericFields = fields.filter(f => f !== 'Included' && f !== '-');
+
+    // One-time = second-to-last numeric if 5+ columns present, else 0
+    // We detect 5-column bills by checking if "One-time charges" appears in the table header
+    const hasOneTimeCol = /One-time charges/i.test(block);
+    const oneTimeStr = hasOneTimeCol && numericFields.length >= 2
+      ? numericFields[numericFields.length - 2]
+      : '-';
+
+    const plans   = plansStr === 'Included' ? 'included' : plansStr === '-' ? 0 : parseMoney(plansStr);
+    const equip   = parseMoney(equipStr);
+    const oneTime = parseMoney(oneTimeStr);
     const rawTotal = numericFields.length ? parseMoney(numericFields[numericFields.length-1]) : 0;
 
-    rawLines.push({ number:`(${area}) ${pre}-${line4}`, last4:line4, lineType, plans, equip, rawTotal });
+    rawLines.push({ number:`(${area}) ${pre}-${line4}`, last4:line4, lineType, plans, equip, oneTime, rawTotal });
   }
 
   if (!rawLines.length) throw new Error('No phone lines found in summary table.');
@@ -303,16 +310,21 @@ function parseBill(text) {
   const includedLines = rawLines.filter(l => l.plans === 'included');
   const sharedPerLine = includedLines.length ? accountBase / includedLines.length : 0;
 
-  // 7. Apply equipment reassignment:
-  //    For lines in EQUIP_REASSIGN, move their equipment charge to the target line
-  //    and zero out their own equipment
-  const equipBonuses = {}; // last4 → extra equipment bonus to add
+  // 7. Apply equipment reassignment
+  const equipBonuses = {};
   rawLines.forEach(l => {
     if (EQUIP_REASSIGN[l.last4]) {
       const targetLast4 = EQUIP_REASSIGN[l.last4];
       equipBonuses[targetLast4] = (equipBonuses[targetLast4] || 0) + l.equip;
-      l.equip = 0; // remove from original line
+      l.equip = 0;
     }
+  });
+
+  // 7b. One-time charges are already parsed from the summary table above (oneTime field).
+  //     No need to scan detailed section — the table is the source of truth.
+  const extraCharges = {};
+  rawLines.forEach(l => {
+    if (l.oneTime > 0) extraCharges[l.last4] = l.oneTime;
   });
 
   // 8. Compute each line's split amount
@@ -325,17 +337,20 @@ function parseBill(text) {
     }
     // Add any reassigned equipment bonuses
     baseAmount += (equipBonuses[l.last4] || 0);
+    // Add international / extra charges if any
+    const extra = extraCharges[l.last4] || 0;
+    baseAmount += extra;
     const amount = Math.round(baseAmount * 100) / 100;
 
-    // Determine visibility:
-    // - Lines in ABSORB_INTO are hidden by default (absorbed by another person)
-    // - $0 lines are hidden by default
+    // Determine visibility
     const isAbsorbed = !!ABSORB_INTO[l.last4];
     const include = !isAbsorbed && amount !== 0;
 
-    const noteTag = isAbsorbed
-      ? `absorbed by ${NAME_MAP[ABSORB_INTO[l.last4]] || ABSORB_INTO[l.last4]}`
-      : (EQUIP_REASSIGN[l.last4] ? `equip → ${NAME_MAP[EQUIP_REASSIGN[l.last4]]}` : '');
+    const noteParts = [];
+    if (isAbsorbed) noteParts.push(`absorbed by ${NAME_MAP[ABSORB_INTO[l.last4]] || ABSORB_INTO[l.last4]}`);
+    if (EQUIP_REASSIGN[l.last4]) noteParts.push(`equip → ${NAME_MAP[EQUIP_REASSIGN[l.last4]]}`);
+    if (extra > 0) noteParts.push(`+$${extra.toFixed(2)} one-time`);
+    const noteTag = noteParts.join(' · ');
 
     return {
       number: l.number, last4: l.last4, lineType: l.lineType,

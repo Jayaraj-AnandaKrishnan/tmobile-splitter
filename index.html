@@ -262,9 +262,19 @@ function parseMoney(s) {
 
 // ─── Core parser ─────────────────────────────────────────────────────────────
 function parseBill(text) {
-  // 1. Total Due
-  const tm = text.match(/TOTAL DUE\s*\$\s*([\d,]+\.\d{2})/i);
-  billTotal = tm ? parseMoney(tm[1]) : 0;
+  // 1. Total Due — try multiple patterns to handle pdf.js layout variations
+  // pdf.js sometimes separates "TOTAL DUE" and "$413.49" across layout blocks
+  const tm = text.match(/TOTAL DUE[\s\S]{0,10}\$([\d,]+\.\d{2})/i);
+  // Fallback: grab the last $ amount on the Totals row in the summary table
+  // The Totals row format: "Totals $X.XX $X.XX $X.XX [$X.XX] $GRAND_TOTAL"
+  // We isolate it by finding "Totals" up to "Account" (next row)
+  const totalsRowMatch = text.match(/\bTotals\b([\s\S]{0,120}?)\bAccount\b/);
+  const totalsRowAmounts = totalsRowMatch
+    ? totalsRowMatch[1].match(/\$([\d,]+\.\d{2})/g) : null;
+  const fallbackTotal = totalsRowAmounts
+    ? parseMoney(totalsRowAmounts[totalsRowAmounts.length - 1]) : 0;
+
+  billTotal = tm ? parseMoney(tm[1]) : fallbackTotal;
 
   // 2. Bill date
   const dm = text.match(/Bill issue date\s+([\w]+\s+\d{2},\s*\d{4})/i);
